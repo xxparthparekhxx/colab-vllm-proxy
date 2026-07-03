@@ -17,6 +17,7 @@ nohup vllm serve google/gemma-4-E4B-it \
 echo "[2/4] Starting deepseek-ocr (deepseek-ai/DeepSeek-OCR) on :8002 ..."
 nohup vllm serve deepseek-ai/DeepSeek-OCR \
   --host 127.0.0.1 --port 8002 \
+  --enforce-eager \
   --logits_processors vllm.model_executor.models.deepseek_ocr:NGramPerReqLogitsProcessor \
   --no-enable-prefix-caching \
   --mm-processor-cache-gb 0 \
@@ -27,7 +28,7 @@ nohup vllm serve deepseek-ai/DeepSeek-OCR \
 echo "[3/4] Starting nomic-embed-text on :8003 ..."
 nohup vllm serve nomic-ai/nomic-embed-text-v1.5 \
   --host 127.0.0.1 --port 8003 \
-  --task embed \
+  --runner pooling \
   --trust-remote-code \
   --gpu-memory-utilization 0.15 \
   > logs/nomic-embed.log 2>&1 &
