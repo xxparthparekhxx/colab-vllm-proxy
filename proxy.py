@@ -70,6 +70,16 @@ def resolve_model(name: str) -> Optional[dict]:
     return MODEL_MAP.get(base) or MODEL_MAP.get(name)
 
 
+def resolve_host() -> str:
+    """Bind loopback by default; an empty HOST is treated as unset.
+
+    os.environ.get("HOST", "127.0.0.1") returns "" when HOST is set but empty,
+    which uvicorn interprets as "bind every interface". Treat an empty string
+    as unset so the proxy never accidentally binds 0.0.0.0 / [::].
+    """
+    return os.environ.get("HOST") or "127.0.0.1"
+
+
 # ---------------------------------------------------------------------------
 # Error translation: Ollama clients expect {"error": "..."} JSON, never a
 # plain-text FastAPI 500.
@@ -106,6 +116,22 @@ def error_message_from_body(status_code: int, body: bytes) -> str:
         detail = detail[:500] + "..."
     message = f"upstream error {status_code}"
     return f"{message}: {detail}" if detail else message
+
+
+async def read_json_body(req: Request):
+    """Parse the request body as a JSON object.
+
+    Returns (body, None) on success, or (None, JSONResponse) with a 400
+    Ollama-style {"error": ...} body when the JSON is invalid or not an object.
+    Ollama clients expect {"error": "..."} JSON, never a plain-text 500.
+    """
+    try:
+        body = await req.json()
+    except (ValueError, TypeError) as exc:
+        return None, ollama_error(f"invalid JSON: {exc}", 400)
+    if not isinstance(body, dict):
+        return None, ollama_error("request body must be a JSON object", 400)
+    return body, None
 
 
 def error_json_line(message: str) -> str:
@@ -185,6 +211,20 @@ def proxy_api_key() -> str:
     return os.environ.get("PROXY_API_KEY", "").strip()
 
 
+def require_valid_api_key() -> None:
+    """Fail closed if PROXY_API_KEY is set but blank after stripping.
+
+    A whitespace-only key must not silently disable auth; refuse to start
+    instead with a clear error.
+    """
+    api_key = os.environ.get("PROXY_API_KEY")
+    if api_key is not None and not api_key.strip():
+        raise SystemExit(
+            "PROXY_API_KEY is set but is blank (whitespace only); refusing to "
+            "start because that would silently disable authentication."
+        )
+
+
 @app.middleware("http")
 async def require_api_key(request: Request, call_next):
     api_key = proxy_api_key()
@@ -238,8 +278,12 @@ async def tags():
 
 @app.post("/api/generate")
 async def generate(req: Request):
-    body = await req.json()
-    model_name = body["model"]
+    body, err = await read_json_body(req)
+    if err is not None:
+        return err
+    model_name = body.get("model")
+    if model_name is None:
+        return ollama_error("missing 'model' in request body", 400)
     cfg = resolve_model(model_name)
     if cfg is None:
         return JSONResponse({"error": f"model '{model_name}' not found"}, status_code=404)
@@ -337,8 +381,12 @@ async def stream_generate(backend, payload, model_name):
 
 @app.post("/api/chat")
 async def chat(req: Request):
-    body = await req.json()
-    model_name = body["model"]
+    body, err = await read_json_body(req)
+    if err is not None:
+        return err
+    model_name = body.get("model")
+    if model_name is None:
+        return ollama_error("missing 'model' in request body", 400)
     cfg = resolve_model(model_name)
     if cfg is None:
         return JSONResponse({"error": f"model '{model_name}' not found"}, status_code=404)
@@ -426,8 +474,12 @@ async def stream_chat(backend, payload, model_name):
 
 @app.post("/api/embeddings")
 async def embeddings(req: Request):
-    body = await req.json()
-    model_name = body["model"]
+    body, err = await read_json_body(req)
+    if err is not None:
+        return err
+    model_name = body.get("model")
+    if model_name is None:
+        return ollama_error("missing 'model' in request body", 400)
     cfg = resolve_model(model_name)
     if cfg is None:
         return JSONResponse({"error": f"model '{model_name}' not found"}, status_code=404)
@@ -454,8 +506,12 @@ async def embeddings(req: Request):
 
 @app.post("/api/embed")
 async def embed(req: Request):
-    body = await req.json()
-    model_name = body["model"]
+    body, err = await read_json_body(req)
+    if err is not None:
+        return err
+    model_name = body.get("model")
+    if model_name is None:
+        return ollama_error("missing 'model' in request body", 400)
     cfg = resolve_model(model_name)
     if cfg is None:
         return JSONResponse({"error": f"model '{model_name}' not found"}, status_code=404)
@@ -487,6 +543,8 @@ if __name__ == "__main__":
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Fail closed on a blank key before binding any socket.
+    require_valid_api_key()
     # Bind loopback by default; cloudflared runs on the same host. Set HOST=0.0.0.0
     # only if you really want the port reachable from the network.
-    uvicorn.run(app, host=os.environ.get("HOST", "127.0.0.1"), port=11434)
+    uvicorn.run(app, host=resolve_host(), port=11434)

@@ -222,3 +222,111 @@ def test_auth_covers_post_routes(client, monkeypatch):
     r = client.post("/api/generate", json={"model": "gemma4", "prompt": "hi"})
     assert r.status_code == 401
     assert "error" in r.json()
+
+
+# ---------------------------------------------------------------------------
+# Host resolution (no real server started)
+# ---------------------------------------------------------------------------
+
+def test_resolve_host_defaults_to_loopback(monkeypatch):
+    monkeypatch.delenv("HOST", raising=False)
+    assert proxy_module.resolve_host() == "127.0.0.1"
+
+
+def test_resolve_host_empty_is_treated_as_unset(monkeypatch):
+    monkeypatch.setenv("HOST", "")
+    assert proxy_module.resolve_host() == "127.0.0.1"
+
+
+def test_resolve_host_uses_set_value(monkeypatch):
+    monkeypatch.setenv("HOST", "0.0.0.0")
+    assert proxy_module.resolve_host() == "0.0.0.0"
+
+    monkeypatch.setenv("HOST", "127.0.0.1")
+    assert proxy_module.resolve_host() == "127.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# /api/chat stream=true upstream 500
+# ---------------------------------------------------------------------------
+
+def test_chat_stream_upstream_500_yields_error_and_done(client, fake_upstream):
+    fake_upstream(lambda request: httpx.Response(500, json={"error": "model crashed"}))
+
+    r = client.post(
+        "/api/chat",
+        json={"model": "gemma4", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+
+    assert r.headers["content-type"].startswith("application/x-ndjson")
+    chunks = ndjson(r.text)
+    assert len(chunks) >= 2
+    assert any("model crashed" in c.get("error", "") for c in chunks)
+    assert chunks[-1]["done"] is True
+    # No partial content chunks: the upstream failed before producing any.
+    assert all(c.get("message", {}).get("content", "") == "" for c in chunks)
+
+
+# ---------------------------------------------------------------------------
+# Malformed requests -> 400 JSON (never a plain-text 500)
+# ---------------------------------------------------------------------------
+
+def test_generate_invalid_json_returns_400_json(client):
+    r = client.post(
+        "/api/generate",
+        content="not json at all",
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 400
+    assert r.headers["content-type"].startswith("application/json")
+    assert "error" in r.json()
+    assert "invalid JSON" in r.json()["error"]
+
+
+def test_generate_missing_model_returns_400_json(client):
+    r = client.post("/api/generate", json={"prompt": "hi"})
+    assert r.status_code == 400
+    assert r.headers["content-type"].startswith("application/json")
+    assert "error" in r.json()
+    assert "model" in r.json()["error"].lower()
+
+
+def test_chat_invalid_json_returns_400_json(client):
+    r = client.post(
+        "/api/chat",
+        content="{",
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 400
+    assert r.headers["content-type"].startswith("application/json")
+    assert "error" in r.json()
+
+
+def test_chat_missing_model_returns_400_json(client):
+    r = client.post("/api/chat", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
+    assert r.headers["content-type"].startswith("application/json")
+    assert "error" in r.json()
+    assert "model" in r.json()["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Whitespace-only key refuses to start (fail closed)
+# ---------------------------------------------------------------------------
+
+def test_blank_api_key_refuses_to_start(monkeypatch):
+    monkeypatch.setenv("PROXY_API_KEY", "   ")
+    with pytest.raises(SystemExit) as exc:
+        proxy_module.require_valid_api_key()
+    assert exc.value.code
+    assert "PROXY_API_KEY" in str(exc.value)
+
+
+def test_unset_api_key_does_not_refuse_to_start(monkeypatch):
+    monkeypatch.delenv("PROXY_API_KEY", raising=False)
+    proxy_module.require_valid_api_key()  # must not raise
+
+
+def test_valid_api_key_does_not_refuse_to_start(monkeypatch):
+    monkeypatch.setenv("PROXY_API_KEY", "s3cret")
+    proxy_module.require_valid_api_key()  # must not raise

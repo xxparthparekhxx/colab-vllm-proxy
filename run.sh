@@ -21,6 +21,28 @@ mkdir -p logs
 READY_TIMEOUT="${READY_TIMEOUT:-900}"
 RESTART_BACKOFF_START="${RESTART_BACKOFF_START:-5}"
 RESTART_BACKOFF_MAX="${RESTART_BACKOFF_MAX:-300}"
+# Treat an empty HOST as unset, matching proxy.py: never bind every interface.
+PROXY_HOST="${HOST:-127.0.0.1}"
+
+# PIDs of the background supervisor bash processes, so we can shut them down
+# (and their vLLM children) on any exit path.
+supervisor_pids=()
+
+cleanup() {
+  local code=$?
+  # Stop every supervisor and its vLLM children so a failed or interrupted
+  # run can't leave supervisors restarting vLLM behind it.
+  local pid child
+  for pid in "${supervisor_pids[@]}"; do
+    [ -n "$pid" ] || continue
+    for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+      kill "$child" 2>/dev/null || true
+    done
+    kill "$pid" 2>/dev/null || true
+  done
+  exit "$code"
+}
+trap cleanup EXIT INT TERM
 
 # Keep one vLLM server alive: restart it with capped exponential backoff.
 # The backoff resets after a run that stayed up for at least 60 seconds.
@@ -53,6 +75,7 @@ start_supervised() {
   local name="$1" log="$2"
   shift 2
   nohup bash -c 'supervise "$@"' _ "$name" "$log" "$@" > /dev/null 2>&1 &
+  supervisor_pids+=("$!")
 }
 
 echo "[1/4] Starting gemma4 (google/gemma-4-E4B-it) on :8001 ..."
@@ -111,11 +134,12 @@ for port in 8001 8002 8003; do
   echo "  :${port} is up"
 done
 
-echo "[4/4] Starting Ollama-compatible proxy on ${HOST:-127.0.0.1}:11434 ..."
-nohup python proxy.py > logs/proxy.log 2>&1 &
-
 echo ""
 echo "All up. Point Cloudflare / your app at port 11434, exactly like before."
-echo "The proxy listens on ${HOST:-127.0.0.1}:11434; keep cloudflared on this host."
+echo "The proxy listens on ${PROXY_HOST}:11434; keep cloudflared on this host."
 echo "Logs: logs/gemma4.log, logs/deepseek-ocr.log, logs/nomic-embed.log, logs/proxy.log"
 echo "Tail everything with: tail -f logs/*.log"
+echo "[4/4] Starting Ollama-compatible proxy on ${PROXY_HOST}:11434 ..."
+# Run in the foreground so the EXIT trap shuts down the vLLM supervisors when
+# the proxy stops (Ctrl-C, crash, or `exit`).
+python proxy.py > logs/proxy.log 2>&1
