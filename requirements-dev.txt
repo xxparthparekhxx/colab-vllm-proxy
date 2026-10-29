@@ -1,0 +1,6 @@
+# Test/dev dependencies only. vllm is intentionally omitted: the proxy and its
+# tests talk to a fake upstream, so no GPU stack is required.
+fastapi
+uvicorn[standard]
+httpx
+pytest
